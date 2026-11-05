@@ -27,8 +27,7 @@ class StudentInput(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "Placement Prediction API is running", "version": "1.0"}
-
+    return {"message": "Placement Prediction API is running", "version": "1.1"}
 
 @app.get("/health")
 def health():
