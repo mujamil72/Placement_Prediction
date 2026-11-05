@@ -3,3 +3,5 @@ FastAPI service that predicts student placement status (Placed / NotPlaced) from
 Used for MLOps Practical-9 (GitHub Actions + GHCR).
 
 Endpoints: GET /health, POST /predict (see test_payload.json)
+
+Version 1.1 - CI/CD update test for Practical-9.
