@@ -25,6 +25,11 @@ class StudentInput(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+@app.get("/")
+def root():
+    return {"message": "Placement Prediction API is running", "version": "1.0"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
