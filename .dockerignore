@@ -1,0 +1,5 @@
+data/
+train.py
+.git
+.github
+__pycache__/
