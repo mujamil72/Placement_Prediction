@@ -1,88 +1,59 @@
 import logging
-import sys
 import time
 import uuid
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.exceptions import RequestValidationError
-from fastapi.exception_handlers import request_validation_exception_handler
-from pydantic import BaseModel, Field
 import joblib
 import pandas as pd
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
+from prometheus_client import Counter, Histogram, Gauge
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
+# ---------- Logging (Practical-11) ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s │ %(levelname)s │ %(name)s │ %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("placement_api")
+
+# ---------- Prometheus metrics (Practical-12) ----------
+HTTP_REQUESTS = Counter(
+    "student_api_http_requests_total",
+    "Total HTTP requests received by the API",
+    ["method", "path", "status"],
 )
 
-logger = logging.getLogger("placement-api")
+HTTP_LATENCY = Histogram(
+    "student_api_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"],
+)
+
+PREDICTIONS = Counter(
+    "student_api_predictions_total",
+    "Total prediction attempts",
+    ["result"],
+)
+
+MODEL_LOADED = Gauge(
+    "student_api_model_loaded",
+    "Whether the model is loaded",
+)
 
 app = FastAPI(title="Placement Prediction API")
 
-MODEL_FILE = "model.pkl"
-
+# ---------- Model loading ----------
 try:
-    artifact = joblib.load(MODEL_FILE)
+    artifact = joblib.load("model.pkl")
     model = artifact["model"]
     FEATURES = artifact["features"]
-    logger.info("event=model_loaded model_file=%s", MODEL_FILE)
+    MODEL_LOADED.set(1)
+    logger.info("event=model_loaded model_file=model.pkl")
 except Exception:
-    logger.exception("event=model_load_failed model_file=%s", MODEL_FILE)
+    MODEL_LOADED.set(0)
+    logger.exception("event=model_load_failed model_file=model.pkl")
     raise
-
-
-@app.middleware("http")
-async def request_logging_middleware(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    start = time.perf_counter()
-
-    try:
-        response = await call_next(request)
-        duration_ms = (time.perf_counter() - start) * 1000
-
-        level = logging.WARNING if response.status_code >= 400 else logging.INFO
-        logger.log(
-            level,
-            "event=http_request request_id=%s method=%s path=%s status=%s duration_ms=%.2f",
-            request_id,
-            request.method,
-            request.url.path,
-            response.status_code,
-            duration_ms,
-        )
-
-        response.headers["X-Request-ID"] = request_id
-        return response
-
-    except Exception:
-        duration_ms = (time.perf_counter() - start) * 1000
-        logger.exception(
-            "event=http_request_failed request_id=%s method=%s path=%s duration_ms=%.2f",
-            request_id,
-            request.method,
-            request.url.path,
-            duration_ms,
-        )
-        raise
-
-
-@app.exception_handler(RequestValidationError)
-async def validation_error_handler(request: Request, exc: RequestValidationError):
-    fields = [
-        ".".join(str(part) for part in error.get("loc", []))
-        for error in exc.errors()
-    ]
-
-    logger.warning(
-        "event=validation_error path=%s field_locations=%s error_count=%s",
-        request.url.path,
-        fields,
-        len(exc.errors()),
-    )
-
-    return await request_validation_exception_handler(request, exc)
 
 
 class StudentInput(BaseModel):
@@ -100,9 +71,49 @@ class StudentInput(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+# ---------- Middleware: logging + metrics ----------
+@app.middleware("http")
+async def log_and_measure(request: Request, call_next):
+    request_id = str(uuid.uuid4())[:8]
+    path = request.url.path
+    method = request.method
+    start_time = time.perf_counter()
+
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except Exception:
+        duration = time.perf_counter() - start_time
+        if path != "/metrics":
+            HTTP_REQUESTS.labels(method=method, path=path, status="500").inc()
+            HTTP_LATENCY.labels(method=method, path=path).observe(duration)
+        logger.exception(
+            "event=request_failed request_id=%s method=%s path=%s",
+            request_id, method, path,
+        )
+        raise
+
+    duration = time.perf_counter() - start_time
+
+    # Do not count Prometheus' own scrape requests in user-traffic metrics
+    if path != "/metrics":
+        HTTP_REQUESTS.labels(method=method, path=path, status=str(status)).inc()
+        HTTP_LATENCY.labels(method=method, path=path).observe(duration)
+
+    level = logging.WARNING if status >= 400 else logging.INFO
+    logger.log(
+        level,
+        "event=request_completed request_id=%s method=%s path=%s status=%s duration=%.4f",
+        request_id, method, path, status, duration,
+    )
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+# ---------- Endpoints ----------
 @app.get("/")
 def root():
-    return {"message": "Placement Prediction API is running", "version": "1.1"}
+    return {"message": "Placement Prediction API is running", "version": "1.0"}
 
 
 @app.get("/health")
@@ -110,27 +121,14 @@ def health():
     return {"status": "ok"}
 
 
-# Add only non-sensitive features here if input-value logging is required.
-SAFE_INPUT_FIELDS = set()
+@app.get("/metrics")
+def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/predict")
 def predict(data: StudentInput):
     try:
-        payload = data.model_dump()
-
-        safe_input = {
-            key: value
-            for key, value in payload.items()
-            if key in SAFE_INPUT_FIELDS
-        }
-
-        logger.info(
-            "event=prediction_request feature_names=%s safe_input=%s",
-            sorted(payload.keys()),
-            safe_input,
-        )
-
         row = {
             "CGPA": data.CGPA,
             "Internships": data.Internships,
@@ -147,11 +145,14 @@ def predict(data: StudentInput):
         pred = int(model.predict(df)[0])
         prob = float(model.predict_proba(df)[0][pred])
 
-        result = "Placed" if pred == 1 else "NotPlaced"
-        logger.info("event=prediction_success prediction=%s", result)
+        PREDICTIONS.labels(result="success").inc()
+        logger.info("event=prediction_succeeded")
 
-        return {"prediction": result, "confidence": round(prob, 4)}
-
+        return {
+            "prediction": "Placed" if pred == 1 else "NotPlaced",
+            "confidence": round(prob, 4),
+        }
     except Exception:
+        PREDICTIONS.labels(result="error").inc()
         logger.exception("event=prediction_failed")
-        raise HTTPException(status_code=500, detail="Prediction failed")
+        raise
